@@ -126,24 +126,37 @@ Difficulty doubles roughly per extra character. Rough times on M3 Max:
 
 ---
 
-## Forbidden / unusual patterns
+## Forbidden / impossible patterns
 
 Base58 doesn't use `0`, `O`, `I`, `l` — the miner rejects any pattern that
 contains those.
 
-There's also a subtle constraint on **leading** characters: a SHA-256 digest
-treated as a 256-bit integer is large enough to need 44 base58 digits ~94%
-of the time, and in that case its first character is forced into the first
-18 chars of the alphabet:
+**Leading-character constraint.** Canonical Octra addresses (the form the
+webcli displays) are always `oct` + exactly 44 base58 chars, with the base58
+left-padded with `1`s. The first base58 char of such an address is
+mathematically constrained to:
 
 ```
 1 2 3 4 5 6 7 8 9 A B C D E F G H J
 ```
 
-The other ~6% of the time the digest happens to be smaller than `58^43` and
-encodes shorter — only then can the address begin with `K`–`Z` or `a`–`z`.
-So a prefix like `octu...` is still possible, just ~50× rarer per key than a
-prefix like `octa...`. The miner doesn't reject these — it just takes longer.
+— 18 options out of 58. Any prefix like `octa...` or `octu...` is **impossible**
+no matter how long you mine. The miner fails fast on unreachable prefixes:
+
+```
+$ ./octra_vanity_metal --prefix utxo
+Pattern 'utxo' starts with 'u', but canonical Octra addresses
+always begin with one of:  1 2 3 4 5 6 7 8 9 A B C D E F G H J
+```
+
+(The math: a SHA-256 digest read as a 256-bit big-endian integer fits in 44
+base58 digits because `2^256 < 58^44`, and the most-significant digit is
+`floor(D / 58^43)`, which is bounded by `floor(2^256 / 58^43) = 17`. When the
+digest happens to be smaller than `58^43` — about 5.8% of the time — webcli
+left-pads with `1`s to keep length at 44, so the first char then becomes `1`.)
+
+`--suffix`, `--anywhere`, and the `--rep-*` modes have no such constraint and
+accept any valid base58 chars.
 
 ---
 

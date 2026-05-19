@@ -8,6 +8,7 @@ import Foundation
 import Metal
 import QuartzCore
 import IOKit
+import Darwin  // flock
 
 // MARK: - Shader-matching constants
 
@@ -74,6 +75,20 @@ func validB58(_ s: String) -> Bool {
     return true
 }
 
+// Canonical Octra addresses are `oct` + 44 chars of base58 left-padded with '1'.
+// The first base58 char is the most-significant digit of a 256-bit SHA-256
+// integer (or '1' padding when the digest is small), so it is constrained to
+// the alphabet's first 18 chars: 1 2 3 4 5 6 7 8 9 A B C D E F G H J.
+let CANONICAL_LEADING: Set<Character> = Set("123456789ABCDEFGHJ")
+
+func feasibleLeadingChar(_ c: Character, caseInsensitive: Bool) -> Bool {
+    if CANONICAL_LEADING.contains(c) { return true }
+    if caseInsensitive {
+        if let upper = c.uppercased().first, CANONICAL_LEADING.contains(upper) { return true }
+    }
+    return false
+}
+
 func b64encode32(_ bytes: [UInt8]) -> String {
     return Data(bytes).base64EncodedString()
 }
@@ -90,6 +105,36 @@ func writeWallet(filename: String, priv: String, addr: String, rpc: String) {
     do { try s.write(toFile: filename, atomically: true, encoding: .utf8) }
     catch { FileHandle.standardError.write("  Warning: could not save wallet file: \(error)\n".data(using: .utf8)!) }
 }
+
+// MARK: - Single-instance lock
+//
+// Two miners on the same GPU just thrash each other and risk overwriting
+// `wallet_*.json` files in the same cwd. We take an exclusive non-blocking
+// flock on a fixed path at startup; the kernel releases it when the process
+// exits (including SIGKILL), so stale locks aren't a problem.
+
+let lockPath = "/tmp/octra_vanity_metal.lock"
+let lockFd = open(lockPath, O_RDWR | O_CREAT, 0o600)
+if lockFd < 0 {
+    FileHandle.standardError.write("Failed to open lock file \(lockPath): \(String(cString: strerror(errno)))\n".data(using: .utf8)!)
+    exit(1)
+}
+if flock(lockFd, LOCK_EX | LOCK_NB) != 0 {
+    let pid = (try? String(contentsOfFile: lockPath, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "?"
+    FileHandle.standardError.write("""
+
+      Another octra_vanity_metal is already running (pid \(pid), lockfile \(lockPath)).
+      Two miners on the same GPU just slow each other down and can race on
+      wallet_*.json. Wait for it to finish, or kill it first.
+
+
+    """.data(using: .utf8)!)
+    exit(1)
+}
+// Write our pid so the error message above can identify the holder.
+let pidStr = "\(getpid())\n"
+ftruncate(lockFd, 0)
+_ = pidStr.withCString { ptr in write(lockFd, ptr, strlen(ptr)) }
 
 // MARK: - GPU utilisation (IOKit)
 
@@ -271,15 +316,68 @@ print()
 var cfg = VanityCfg()
 var rpc = cli.rpc
 
+// Canonical Octra addresses are exactly 47 chars: "oct" + 44 base58.
+let MAX_PATTERN_LEN = 44
+
+func rejectImpossibleLeading(_ pat: String, ci: Bool) {
+    guard let first = pat.first else { return }
+    if !feasibleLeadingChar(first, caseInsensitive: ci) {
+        print("""
+
+          Pattern '\(pat)' starts with '\(first)', but canonical Octra addresses
+          always begin with one of:  1 2 3 4 5 6 7 8 9 A B C D E F G H J
+          (The first base58 digit of a SHA-256 integer is bounded by floor(2^256 / 58^43) = 17.)
+
+          Use --anywhere or --suffix if you want '\(first)' to appear elsewhere
+          in the address, or pick a different leading char.
+
+        """)
+        exit(2)
+    }
+}
+
+func rejectTooLong(_ pat: String, mode: Int32) {
+    if pat.count > MAX_PATTERN_LEN {
+        let kind: String
+        switch mode {
+        case MODE_PREFIX:   kind = "Prefix"
+        case MODE_SUFFIX:   kind = "Suffix"
+        case MODE_ANYWHERE: kind = "Anywhere-pattern"
+        default:            kind = "Pattern"
+        }
+        print("""
+
+          \(kind) '\(pat)' is \(pat.count) chars but canonical Octra addresses are
+          exactly oct + 44 base58 chars. Anything longer than \(MAX_PATTERN_LEN) is impossible.
+
+        """)
+        exit(2)
+    }
+}
+
+func rejectImpossibleRep(_ rep: Int) {
+    if rep > MAX_PATTERN_LEN {
+        print("""
+
+          \(rep) consecutive identical chars can't fit in a 44-char address.
+
+        """)
+        exit(2)
+    }
+}
+
 if cli.nonInteractive {
     cfg.mode = cli.mode!
     switch cfg.mode {
     case MODE_PREFIX, MODE_SUFFIX, MODE_ANYWHERE:
         guard let p = cli.pattern, !p.isEmpty else { print("Missing pattern."); exit(2) }
         if !validB58(p) { print("Pattern '\(p)' contains non-base58 characters."); exit(2) }
+        rejectTooLong(p, mode: cfg.mode)
         cfg.setPattern(p)
+        if cfg.mode == MODE_PREFIX { rejectImpossibleLeading(p, ci: cli.caseInsensitive) }
     case MODE_REP_START, MODE_REP_END, MODE_REP_ANY:
         if cli.rep < 2 { print("--rep-* requires N >= 2"); exit(2) }
+        rejectImpossibleRep(cli.rep)
         cfg.rep = Int32(cli.rep)
     default: print("Pick a mode."); usage(); exit(2)
     }
@@ -307,21 +405,30 @@ if cli.nonInteractive {
         let label = ["", "prefix", "suffix", "anywhere"][type]
         print("  Enter the pattern (\(label)).")
         print("  Valid chars: 123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
-        print("  Note: 0 O I l are NOT in base58.\n")
+        print("  Note: 0 O I l are NOT in base58.")
+        if type == 1 {
+            print("  Note: canonical Octra addresses begin with one of 1-9 A-H J — pick accordingly.")
+        }
+        print()
+        cfg.mode = (type == 1) ? MODE_PREFIX : (type == 2) ? MODE_SUFFIX : MODE_ANYWHERE
+        print("  Case sensitive? (Y/n) > ", terminator: ""); fflush(stdout)
+        let ans = readLineTrimmed()
+        cfg.caseInsensitive = (ans.first.map { $0 == "n" || $0 == "N" } ?? false) ? 1 : 0
+        let ci = cfg.caseInsensitive != 0
         var pat = ""
         while pat.isEmpty {
             print("  Pattern > ", terminator: ""); fflush(stdout)
             let s = readLineTrimmed()
             if s.isEmpty { print("  Pattern cannot be empty."); continue }
             if !validB58(s) { print("  Contains invalid base58 characters. Try again."); continue }
+            if s.count > MAX_PATTERN_LEN { print("  Pattern is \(s.count) chars; canonical addr only has 44 base58 chars."); continue }
+            if cfg.mode == MODE_PREFIX, let first = s.first, !feasibleLeadingChar(first, caseInsensitive: ci) {
+                print("  '\(first)' can't be the leading char of a canonical Octra address. Try one of 1-9 A-H J.")
+                continue
+            }
             pat = s
         }
-        cfg.mode = (type == 1) ? MODE_PREFIX : (type == 2) ? MODE_SUFFIX : MODE_ANYWHERE
         cfg.setPattern(pat)
-        print()
-        print("  Case sensitive? (Y/n) > ", terminator: ""); fflush(stdout)
-        let ans = readLineTrimmed()
-        cfg.caseInsensitive = (ans.first.map { $0 == "n" || $0 == "N" } ?? false) ? 1 : 0
         print()
         print("  Also record long repeating patterns? (y/N) > ", terminator: ""); fflush(stdout)
         let bonus = readLineTrimmed()

@@ -563,7 +563,8 @@ struct VanityCfg {
     int  rep_bonus_mode;
 };
 
-/* Base58-encode 32 bytes (passed as 8 LE u32) to a string */
+/* Base58-encode 32 bytes (passed as 8 LE u32) to a string, padded with
+ * leading '1's to exactly 44 chars (canonical Octra webcli convention).   */
 static int b58enc(thread const u32 *t_in, thread char *out) {
     u32 t[8];
     for (int i = 0; i < 8; i++) t[i] = t_in[i];
@@ -595,6 +596,10 @@ static int b58enc(thread const u32 *t_in, thread char *out) {
         begin = new_begin;
     }
     for (int i = 0; i < leading; i++) buf[blen++] = '1';
+
+    /* Canonical: pad to 44 chars with extra '1's (these end up at the front
+     * after reversal). Webcli's derive_address does the same.              */
+    while (blen < 44) buf[blen++] = '1';
 
     for (int i = 0; i < blen; i++) out[i] = buf[blen-1-i];
     out[blen] = '\0';
@@ -701,6 +706,7 @@ static bool b58_rep_any_match(thread const u32 *t_in, int rep) {
 
     char prev = '\0';
     int run = 0;
+    int total = 0;
 
     while (begin < 8) {
         int new_begin = 8;
@@ -718,8 +724,17 @@ static bool b58_rep_any_match(thread const u32 *t_in, int rep) {
         else { prev = digit; run = 1; }
         if (run >= rep) return true;
         begin = new_begin;
+        total++;
     }
     for (int i = 0; i < leading; i++) {
+        if (run > 0 && prev == '1') run++;
+        else { prev = '1'; run = 1; }
+        if (run >= rep) return true;
+        total++;
+    }
+    /* Canonical pad with '1's at the front (== last in this LSD-first scan) */
+    int pad = 44 - total;
+    for (int i = 0; i < pad; i++) {
         if (run > 0 && prev == '1') run++;
         else { prev = '1'; run = 1; }
         if (run >= rep) return true;
@@ -763,6 +778,8 @@ static bool check_rep_bonus(thread const u32 *t_in, constant VanityCfg *c) {
         begin = new_begin;
     }
     for (int i = 0; i < leading; i++) buf[blen++] = '1';
+    /* Canonical pad: webcli left-pads base58 with '1' to 44 chars. */
+    while (blen < 44) buf[blen++] = '1';
 
     if (blen < c->rep_bonus) return false;
     char first = buf[blen - 1];
