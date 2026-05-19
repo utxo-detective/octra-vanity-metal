@@ -106,6 +106,30 @@ func writeWallet(filename: String, priv: String, addr: String, rpc: String) {
     catch { FileHandle.standardError.write("  Warning: could not save wallet file: \(error)\n".data(using: .utf8)!) }
 }
 
+// MARK: - Graceful abort on SIGINT / SIGTERM
+//
+// Metal has no public API to cancel an already-committed command buffer.
+// Once we call `cb.commit(); cb.waitUntilCompleted()`, the GPU runs that
+// kernel to completion regardless of whether the host process gets killed.
+// Result: `kill -9` returns immediately but the GPU keeps thrashing for
+// however long the in-flight launch takes (with pathological --iters /
+// --threadgroups, this can be many minutes — the "zombie GPU" experience).
+//
+// We can't preempt the GPU, but we CAN make sure no _new_ launches are
+// issued. Install async signal handlers that flip an atomic abort flag,
+// and have every launch loop check it before dispatching the next batch.
+// To keep response time tight, keep per-launch wall-time bounded (the
+// auto-tune sweep tests many small configs and only one launch is ever
+// in flight, so it observes the abort within ~one launch).
+
+nonisolated(unsafe) var g_abort: Int32 = 0
+let g_abortHandler: @convention(c) (Int32) -> Void = { _ in
+    g_abort = 1
+}
+signal(SIGINT,  g_abortHandler)
+signal(SIGTERM, g_abortHandler)
+signal(SIGHUP,  g_abortHandler)
+
 // MARK: - Single-instance lock
 //
 // Two miners on the same GPU just thrash each other and risk overwriting
@@ -189,6 +213,9 @@ func usage() {
         --no-auto-tune           skip auto-tune even if other knobs unset
         --gpu-budget <pct>       throttle to roughly pct% GPU duty cycle (1..100, default 100 = unthrottled)
         --show-gpu               print live GPU utilisation alongside progress
+        --estimate               benchmark the GPU briefly, compute exact-ish difficulty
+                                 for this pattern (accounting for the leading-char
+                                 constraint and case variants), print, and exit
 
       Misc:
         -h, --help               this text
@@ -210,6 +237,7 @@ struct CLI {
     var autoTune: Bool = true
     var gpuBudget: Int = 100   // 1..100
     var showGpu: Bool = false
+    var estimateOnly: Bool = false
 
     var nonInteractive: Bool = false
 }
@@ -243,6 +271,7 @@ func parseArgs() -> CLI {
         case "--gpu-budget":
             if let v = Int(need(a)) { c.gpuBudget = max(1, min(100, v)) }
         case "--show-gpu":     c.showGpu = true
+        case "--estimate":     c.estimateOnly = true; c.nonInteractive = true
         default:
             print("Unknown argument: \(a)"); usage(); exit(2)
         }
@@ -318,6 +347,153 @@ var rpc = cli.rpc
 
 // Canonical Octra addresses are exactly 47 chars: "oct" + 44 base58.
 let MAX_PATTERN_LEN = 44
+
+// MARK: - Difficulty estimator
+//
+// All probabilities are derived from D = SHA-256(pk) treated as a uniform
+// random 256-bit integer (a fair assumption for SHA-256 on Ed25519 pubkeys).
+//
+//   denom = 2^256 / 58^43 ≈ 17.227
+//
+// The canonical 44-char base58 is `pad-of-1s ++ b58(D)` left-padded to 44.
+// Leading-char distribution:
+//   - '1' (when D < 58^43, i.e. padding kicks in):  1/denom
+//   - '2'..'9', 'A'..'H' (alphabet idx 1..16):      1/denom each
+//   - 'J' (alphabet idx 17):                        (denom-17)/denom
+//   - any other char (K-Z, a-z, etc.):              0
+// At positions 1..43 the next base58 digit is approximately uniform over
+// the 58-char alphabet (slight skew when padding chars later, but well
+// inside the noise of a random search).
+
+let LEADING_DENOM: Double = pow(2.0, 256) / pow(58.0, 43)
+let LEADING_SET_FIRST_17 = Array("123456789ABCDEFGH")  // 17 chars, each ~1/denom
+let LEADING_FALLBACK_J: Character = "J"
+
+func leadingProb(_ c: Character) -> Double {
+    if LEADING_SET_FIRST_17.contains(c) { return 1.0 / LEADING_DENOM }
+    if c == LEADING_FALLBACK_J          { return (LEADING_DENOM - 17.0) / LEADING_DENOM }
+    return 0.0
+}
+
+func bodyProb(_ c: Character) -> Double {
+    if BASE58_ALPHABET.contains(c) { return 1.0 / 58.0 }
+    return 0.0
+}
+
+/// Probability of pattern char `c` matching a single canonical-addr position.
+/// If `leading` is true, applies the leading-char distribution; otherwise body.
+/// Honours case-insensitive by summing both case variants when valid base58.
+func charMatchProb(_ c: Character, leading: Bool, ci: Bool) -> Double {
+    let probFn = leading ? leadingProb : bodyProb
+    var p = probFn(c)
+    if ci, c.isLetter {
+        let other: Character?
+        if c.isLowercase { other = c.uppercased().first }
+        else             { other = c.lowercased().first }
+        if let o = other, o != c { p += probFn(o) }
+    }
+    return p
+}
+
+struct DifficultyEstimate {
+    let probabilityPerKey: Double
+    let expectedKeys: Double
+    var feasible: Bool { return probabilityPerKey > 0 }
+}
+
+func patternStringFromCfg(_ c: VanityCfg) -> String {
+    var out = [CChar]()
+    withUnsafeBytes(of: c.pat) { buf in
+        for b in buf {
+            let cc = CChar(bitPattern: b)
+            if cc == 0 { break }
+            out.append(cc)
+        }
+    }
+    out.append(0)
+    return out.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
+}
+
+func estimateDifficulty(_ cfg: VanityCfg) -> DifficultyEstimate {
+    let ci = cfg.caseInsensitive != 0
+    let pat = patternStringFromCfg(cfg)
+    var p: Double
+
+    switch cfg.mode {
+    case MODE_PREFIX:
+        p = 1.0
+        for (i, c) in pat.enumerated() {
+            p *= charMatchProb(c, leading: i == 0, ci: ci)
+        }
+    case MODE_SUFFIX:
+        p = 1.0
+        for c in pat { p *= charMatchProb(c, leading: false, ci: ci) }
+    case MODE_ANYWHERE:
+        // First position has the leading constraint, the rest don't. We sum
+        // the per-position match probability over all (45 - plen) start positions.
+        let plen = pat.count
+        var pLead = 1.0
+        var pBody = 1.0
+        for (i, c) in pat.enumerated() {
+            pLead *= charMatchProb(c, leading: i == 0, ci: ci)
+            pBody *= charMatchProb(c, leading: false, ci: ci)
+        }
+        let bodyPositions = max(0, 45 - plen - 1)
+        p = pLead + pBody * Double(bodyPositions)
+    case MODE_REP_START:
+        // Leading char in {1..9,A..H,J}, then rep-1 same-char positions.
+        var lead = 0.0
+        for c in "123456789ABCDEFGHJ" {
+            lead += leadingProb(c) * pow(1.0 / 58.0, Double(Int(cfg.rep) - 1))
+        }
+        p = lead
+    case MODE_REP_END:
+        // Last rep chars same; tail char is uniform body.
+        p = pow(1.0 / 58.0, Double(Int(cfg.rep) - 1))
+    case MODE_REP_ANY:
+        let rep = Int(cfg.rep)
+        let perBody = pow(1.0 / 58.0, Double(rep - 1))
+        var perLead = 0.0
+        for c in "123456789ABCDEFGHJ" {
+            perLead += leadingProb(c) * pow(1.0 / 58.0, Double(rep - 1))
+        }
+        let bodyPositions = max(0, 45 - rep - 1)
+        p = perLead + perBody * Double(bodyPositions)
+    default:
+        p = 1.0
+    }
+    return DifficultyEstimate(probabilityPerKey: p, expectedKeys: p > 0 ? 1.0 / p : .infinity)
+}
+
+func humanTime(_ seconds: Double) -> String {
+    if !seconds.isFinite { return "never (pattern is impossible)" }
+    if seconds < 1     { return String(format: "%.0f ms", seconds * 1000) }
+    if seconds < 120   { return String(format: "%.0f s",  seconds) }
+    if seconds < 7200  { return String(format: "%.1f min", seconds / 60) }
+    if seconds < 172800{ return String(format: "%.1f hr",  seconds / 3600) }
+    if seconds < 31_536_000 { return String(format: "%.1f day", seconds / 86400) }
+    return String(format: "%.1f yr", seconds / 31_536_000)
+}
+
+func formatEstimate(_ est: DifficultyEstimate, kps: Double, budgetPct: Int) -> String {
+    let effectiveKps = kps * Double(budgetPct) / 100.0
+    let mean = est.expectedKeys / effectiveKps
+    // Geometric distribution: P(found by N*expected) = 1 - (1-p)^N ≈ 1 - exp(-N).
+    // 50%/90%/99% thresholds = N where 1 - exp(-N) = q, so N = -ln(1-q).
+    let n50 = log(2.0)         // ≈ 0.6931
+    let n90 = log(10.0)        // ≈ 2.3026
+    let n99 = log(100.0)       // ≈ 4.6052
+    return """
+      Per-key match probability: \(String(format: "%.3g", est.probabilityPerKey))
+      Expected keys to try:      \(String(format: "%.3g", est.expectedKeys))
+      Measured GPU rate:         \(String(format: "%.2f MK/s", kps / 1e6)) @ 100%, \(String(format: "%.2f MK/s", effectiveKps / 1e6)) @ \(budgetPct)% budget
+      Time until match:
+        50% chance:  \(humanTime(mean * n50))
+        90% chance:  \(humanTime(mean * n90))
+        99% chance:  \(humanTime(mean * n99))
+        mean:        \(humanTime(mean))
+    """
+}
 
 func rejectImpossibleLeading(_ pat: String, ci: Bool) {
     guard let first = pat.first else { return }
@@ -501,26 +677,11 @@ case MODE_REP_END:   print("  Target:  ...[\(cfg.rep)x same]")
 case MODE_REP_ANY:   print("  Target:  ...[\(cfg.rep)x same]...")
 default: break
 }
-let nForEst: Int = (cfg.mode <= MODE_ANYWHERE) ? Int(cfg.plen) : Int(cfg.rep)
-var difficulty: Double
-switch cfg.mode {
-case MODE_PREFIX, MODE_SUFFIX:       difficulty = pow(58.0, Double(nForEst))
-case MODE_ANYWHERE:                  difficulty = pow(58.0, Double(nForEst)) / 38.0
-case MODE_REP_START, MODE_REP_END:   difficulty = pow(58.0, Double(nForEst - 1))
-case MODE_REP_ANY:                   difficulty = pow(58.0, Double(nForEst - 1)) / 38.0
-default:                             difficulty = 1.0
+let estimate = estimateDifficulty(cfg)
+if !estimate.feasible {
+    print("  Pattern is impossible (per-key probability is 0). Pick something reachable.")
+    exit(2)
 }
-if cfg.caseInsensitive != 0 { difficulty /= pow(2.0, Double(min(nForEst, 22))) }
-let speedEst = 1.5e9
-let seconds = difficulty / speedEst
-let estStr: String
-if seconds < 2 { estStr = "< 1 second" }
-else if seconds < 120 { estStr = String(format: "~%.0f seconds", seconds) }
-else if seconds < 7200 { estStr = String(format: "~%.0f minutes", seconds/60.0) }
-else if seconds < 172800 { estStr = String(format: "~%.1f hours", seconds/3600.0) }
-else { estStr = String(format: "~%.1f days", seconds/86400.0) }
-print(String(format: "  Difficulty: ~%.3g keys on average", difficulty))
-print("  Estimated:  \(estStr)  (assuming \(Int(speedEst/1e6)) MK/s)")
 if cli.gpuBudget < 100 {
     print("  Throttle:   GPU duty-cycle budget \(cli.gpuBudget)%")
 }
@@ -605,18 +766,51 @@ if cli.autoTune {
     var bestKps = 0.0
     var bestTG = threadgroupSize, bestG = threadgroups, bestI = iters
 
-    _ = launch(baseSeed: 0, iters: 4, threadgroups: 1024, tgSize: min(128, maxThreads), pso: pso)
+    // Calibrate from a small reference launch so we can predict how long
+    // every other (tg, g, it) combo would take BEFORE committing it to the
+    // GPU. Metal has no preempt API: once a command buffer is committed,
+    // SIGTERM cannot stop it. So predicting and skipping configs that would
+    // exceed our wall-time cap is the only way to keep the sweep
+    // interruptible.
+    let refTG = min(128, maxThreads)
+    let refG  = 1024
+    let refIt = 4
+    let refKeys = UInt64(refTG) * UInt64(refG) * UInt64(refIt)
+    let refSec  = launch(baseSeed: 0, iters: refIt, threadgroups: refG, tgSize: refTG, pso: pso)
     resetFound(mainOutBuf); resetFound(bonusOutBuf)
+    let refKps  = refSec > 0 ? Double(refKeys) / refSec : 1.0
 
-    for tg in tgs {
+    // Per-launch wall-time cap during auto-tune. We never commit a config
+    // whose predicted runtime exceeds this — keeps Ctrl-C response time
+    // bounded. Sub-second cap is plenty for tuning purposes.
+    let maxLaunchSec = 0.75
+    autoTuneLoop: for tg in tgs {
         for g in groupsList {
             for it in iterList {
+                if g_abort != 0 { break autoTuneLoop }
+                // Predict: assume linear scaling with total key count.
+                // Refined as we learn the actual kps from earlier configs.
+                let estKeys = UInt64(g) * UInt64(tg) * UInt64(it)
+                let liveKps = bestKps > refKps ? bestKps : refKps
+                let predSec = Double(estKeys) / max(liveKps, 1.0)
+                if predSec > maxLaunchSec {
+                    // Bigger iters in this slot will be even worse — skip rest.
+                    break
+                }
                 resetFound(mainOutBuf); resetFound(bonusOutBuf)
                 let ms = launch(baseSeed: 0, iters: it, threadgroups: g, tgSize: tg, pso: pso)
-                let kps = Double(UInt64(g) * UInt64(tg) * UInt64(it)) / max(ms, 1e-9)
+                let kps = Double(estKeys) / max(ms, 1e-9)
                 if kps > bestKps { bestKps = kps; bestTG = tg; bestG = g; bestI = it }
+                // Even if our prediction was rosier than reality, abort the
+                // iter sweep when we actually overshoot.
+                if ms > maxLaunchSec { break }
             }
+            if g_abort != 0 { break autoTuneLoop }
         }
+    }
+    if g_abort != 0 {
+        print("\n  Auto-tune aborted by signal — exiting.")
+        exit(130)
     }
     threadgroupSize = bestTG; threadgroups = bestG; iters = bestI
     print(String(format: "  Auto-tune best: %d groups x %d threads x %d iters  -->  %.2f MK/s\n",
@@ -628,6 +822,28 @@ if cli.autoTune {
 
 let pso = pickPSO(cfg.mode)
 let perLaunch = UInt64(threadgroups) * UInt64(threadgroupSize) * UInt64(iters)
+
+// Quick benchmark for accurate time estimates (and to feed --estimate).
+func quickBenchmarkKps() -> Double {
+    resetFound(mainOutBuf); resetFound(bonusOutBuf)
+    // Warm-up
+    _ = launch(baseSeed: 0xdeadbeef, iters: iters, threadgroups: threadgroups,
+               tgSize: threadgroupSize, pso: pso)
+    resetFound(mainOutBuf); resetFound(bonusOutBuf)
+    let t = launch(baseSeed: 0xcafef00d, iters: iters, threadgroups: threadgroups,
+                   tgSize: threadgroupSize, pso: pso)
+    resetFound(mainOutBuf); resetFound(bonusOutBuf)
+    return t > 0 ? Double(perLaunch) / t : 0
+}
+
+let benchKps = quickBenchmarkKps()
+print(formatEstimate(estimate, kps: benchKps, budgetPct: cli.gpuBudget))
+print()
+
+if cli.estimateOnly {
+    exit(0)
+}
+
 print("  Searching with \(threadgroups) groups x \(threadgroupSize) threads x \(iters) iters = \(perLaunch) keys/launch\n")
 
 func currentBaseSeed() -> UInt64 {
@@ -659,6 +875,10 @@ var lastProgress = Date(timeIntervalSince1970: 0)
 var done = false
 
 while !done {
+    if g_abort != 0 {
+        print("\n  Aborted by signal — current GPU launch finished, no more launches.")
+        exit(130)
+    }
     let elapsedSec = launch(baseSeed: baseSeed, iters: iters,
                             threadgroups: threadgroups, tgSize: threadgroupSize, pso: pso)
     let keysThisLaunch = perLaunch
@@ -667,12 +887,15 @@ while !done {
 
     if cli.gpuBudget < 100 {
         // Duty-cycle throttle: sleep so launch_time / (launch_time + sleep) ≈ budget/100.
-        // sleep = launch * (100 - budget) / budget.
+        // sleep = launch * (100 - budget) / budget. Break the sleep into small
+        // chunks so Ctrl-C/SIGTERM is observed within ~50ms instead of waiting
+        // out the full throttle interval.
         let sleepSec = elapsedSec * Double(100 - cli.gpuBudget) / Double(cli.gpuBudget)
-        if sleepSec > 0 {
-            // usleep takes useconds_t; clamp to avoid overflow on absurd values.
-            let us = min(UInt32(2_000_000), UInt32(sleepSec * 1e6))
-            usleep(us)
+        var remaining = min(2.0, sleepSec)
+        while remaining > 0 && g_abort == 0 {
+            let chunk = min(remaining, 0.05)
+            usleep(UInt32(chunk * 1e6))
+            remaining -= chunk
         }
     }
 
