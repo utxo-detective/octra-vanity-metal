@@ -14,8 +14,8 @@ this miner re-derive correctly through standard ed25519, which is not always
 true of the CUDA reference.
 
 ```
-oct uGa8PpsN FedUsNS4XrJtMKFyzfAPArUhhmevafdT3vL
-    ^^^^^^^
+oct Utxo YZt1UhJPUUSv3SDSqo1YtMfjVk7cgDFrrrjPgoQ
+    ^^^^
     you pick this part
 ```
 
@@ -212,7 +212,7 @@ Metal port by [@utxo-detective](https://github.com/utxo-detective).
 If this saves you a CUDA-rig rental, tips welcome:
 
 ```
-Octra:  octuGa8PpsNFedUsNS4XrJtMKFyzfAPArUhhmevafdT3vL
+Octra:  octUtxoYZt1UhJPUUSv3SDSqo1YtMfjVk7cgDFrrrjPgoQ
 ```
 
 (Mined with this miner, naturally.)
