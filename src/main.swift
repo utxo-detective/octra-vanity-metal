@@ -853,19 +853,19 @@ func currentBaseSeed() -> UInt64 {
     return UInt64(Date().timeIntervalSince1970 * 1e9) ^ 0xc0ffeedeadbeef
 }
 
-func extractFound(_ buf: MTLBuffer) -> (UInt32, [UInt8], String) {
+// Fast path: only read the 4-byte flag (called every loop tick).
+@inline(__always)
+func foundFlag(_ buf: MTLBuffer) -> UInt32 {
+    return buf.contents().load(as: UInt32.self)
+}
+
+// Slow path: only called once on a hit. Reads the 32-byte seed + addr string.
+func extractFoundDetails(_ buf: MTLBuffer) -> ([UInt8], String) {
     let raw = buf.contents()
-    var flag: UInt32 = 0
-    memcpy(&flag, raw, MemoryLayout<UInt32>.size)
-    let seedOff = 8
-    let addrOff = 40
     var seedBytes = [UInt8](repeating: 0, count: 32)
-    memcpy(&seedBytes, raw + seedOff, 32)
-    let addr: String = {
-        let ptr = (raw + addrOff).assumingMemoryBound(to: CChar.self)
-        return String(cString: ptr)
-    }()
-    return (flag, seedBytes, addr)
+    memcpy(&seedBytes, raw + 8, 32)
+    let addr = String(cString: (raw + 40).assumingMemoryBound(to: CChar.self))
+    return (seedBytes, addr)
 }
 
 var baseSeed = currentBaseSeed()
@@ -899,17 +899,20 @@ while !done {
         }
     }
 
-    let (bonusFlag, bSeed, bAddr) = extractFound(bonusOutBuf)
-    if bonusFlag != 0 && !bAddr.isEmpty {
-        print("\r\u{001B}[2K  Found bonus pattern: oct\(bAddr)")
-        let priv = b64encode32(bSeed)
-        let short = String(bAddr.prefix(8))
-        writeWallet(filename: "wallet_bonus_\(short).json", priv: priv, addr: bAddr, rpc: rpc)
-        resetFound(bonusOutBuf)
-        lastProgress = Date(timeIntervalSince1970: 0)
+    let bonusFlag = foundFlag(bonusOutBuf)
+    if bonusFlag != 0 {
+        let (bSeed, bAddr) = extractFoundDetails(bonusOutBuf)
+        if !bAddr.isEmpty {
+            print("\r\u{001B}[2K  Found bonus pattern: oct\(bAddr)")
+            let priv = b64encode32(bSeed)
+            let short = String(bAddr.prefix(8))
+            writeWallet(filename: "wallet_bonus_\(short).json", priv: priv, addr: bAddr, rpc: rpc)
+            resetFound(bonusOutBuf)
+            lastProgress = Date(timeIntervalSince1970: 0)
+        }
     }
 
-    let (mainFlag, _, _) = extractFound(mainOutBuf)
+    let mainFlag = foundFlag(mainOutBuf)
     if mainFlag != 0 { done = true; break }
 
     let now = Date()
@@ -929,7 +932,7 @@ while !done {
     }
 }
 
-let (_, sBytes, sAddr) = extractFound(mainOutBuf)
+let (sBytes, sAddr) = extractFoundDetails(mainOutBuf)
 let elapsed = Date().timeIntervalSince(tStart)
 let kpsFinal = elapsed > 0 ? Double(totalKeys) / elapsed : 0
 let priv = b64encode32(sBytes)

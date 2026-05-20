@@ -335,13 +335,26 @@ static void gf_pack25519_32(thread u32 *o, thread const int *n) {
     }
 }
 
-/* Parity bit of (a mod p). Must do the full pack25519-style reduction —
- * carry-reduce alone leaves the value in [0, ~2p), and since p is odd the
- * low bit flips on subtraction. tweetnacl's par25519 does the same.        */
+/* Parity bit of (a mod p). Same 2-iteration conditional-subtract reduction
+ * as gf_pack25519, but skip the final 32 byte-stores into a buffer we'd
+ * immediately throw away — we only need the low bit of limb 0.            */
 static u8 gf_par(thread const int *a) {
-    u8 d[32];
-    gf_pack25519(d, a);
-    return d[0] & 1;
+    int t[16], m[16];
+    gf_set(t, a);
+    gf_car(t); gf_car(t); gf_car(t);
+
+    for (int j = 0; j < 2; j++) {
+        m[0] = t[0] - 0xffed;
+        for (int i = 1; i < 15; i++) {
+            m[i] = t[i] - 0xffff - ((m[i-1] >> 16) & 1);
+            m[i-1] &= 0xffff;
+        }
+        m[15] = t[15] - 0x7fff - ((m[14] >> 16) & 1);
+        int b = (m[15] >> 16) & 1;
+        m[14] &= 0xffff;
+        gf_sel(t, m, 1 - b);
+    }
+    return (u8)(t[0] & 1);
 }
 
 /* Precomputed point entry — packed 32-byte representations of y+x, y-x, t*d2 */
