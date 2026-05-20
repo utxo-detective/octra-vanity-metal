@@ -8,10 +8,8 @@ This is a Metal port of the CUDA implementation at
 [0x02937/octra_vanity](https://github.com/0x02937/octra_vanity).
 Algorithm is identical (precomputed-window scalar mult, truncated SHA-512,
 32-bit base58 matchers, etc.) — just retargeted from `__device__` CUDA C
-to MSL kernels and a Swift host. **One real bug from the original is fixed
-here** (see [Correctness fix](#correctness-fix) below) — wallets produced by
-this miner re-derive correctly through standard ed25519, which is not always
-true of the CUDA reference.
+to MSL kernels and a Swift host. Wallets produced by this miner re-derive
+correctly through standard ed25519 (verified against libsodium / PyNaCl).
 
 ```
 oct Utxo YZt1UhJPUUSv3SDSqo1YtMfjVk7cgDFrrrjPgoQ
@@ -157,24 +155,6 @@ left-pads with `1`s to keep length at 44, so the first char then becomes `1`.)
 
 `--suffix`, `--anywhere`, and the `--rep-*` modes have no such constraint and
 accept any valid base58 chars.
-
----
-
-## Correctness fix
-
-The original CUDA implementation has a subtle bug in `gf_par`: it carry-
-reduces the `x` coordinate but does not fully reduce it modulo `p =
-2^255 - 19` before taking the parity bit. Because `p` is odd, when `x` is in
-`[p, 2p)` the parity bit is flipped relative to the canonical
-representation. That means roughly half a percent of the wallets the CUDA
-miner produces have a **wrong sign bit in the last byte**, so the address
-printed by the miner doesn't actually correspond to the saved private key
-when re-derived through standard ed25519.
-
-This port follows tweetnacl's `par25519`: full `pack25519` reduction first,
-then read the low bit of byte 0. Wallets produced here always re-derive to
-the address that was printed — you can sanity-check with libsodium / PyNaCl /
-the Octra webcli.
 
 ---
 
